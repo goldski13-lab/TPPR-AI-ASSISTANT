@@ -5,11 +5,10 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from streamlit_plotly_events import plotly_events
-import streamlit.components.v1 as components
-import time, random, datetime
+import time, random, os
 
 st.set_page_config(page_title="TPPR AI — Lab Digital Twin", layout="wide")
-st.title("TPPR AI Safety Assistant — 3D Lab Digital Twin (Loop Layout)")
+st.title("TPPR AI Safety Assistant — 3D Lab Digital Twin (Final)")
 
 # --------- CONFIG ---------
 ROOMS = [
@@ -25,42 +24,34 @@ WARNING_COLOR = "#ffb84d"
 CRITICAL_COLOR = "#ff4c4c"
 
 GASES = ["CH4", "H2S", "CO"]
-BASELINES = {
-    "CH4": (8, 2),
-    "H2S": (2, 0.7),
-    "CO" : (5, 1.5),
-}
-THRESHOLDS = {
-    "CH4": {"warning": 25, "critical": 50},
-    "H2S": {"warning": 10, "critical": 20},
-    "CO" : {"warning": 30, "critical": 60},
-}
-COLOR_MAP = {
-    "CH4": "#1f77b4",
-    "H2S": "#2ca02c",
-    "CO":  "#d62728",
-}
+BASELINES = {"CH4": (8, 2), "H2S": (2, 0.7), "CO" : (5, 1.5)}
+THRESHOLDS = {"CH4": {"warning": 25, "critical": 50},
+              "H2S": {"warning": 10, "critical": 20},
+              "CO" : {"warning": 30, "critical": 60}}
+COLOR_MAP = {"CH4": "#1f77b4", "H2S": "#2ca02c", "CO": "#d62728"}
 
 # --------- INIT STATE ---------
 if "df" not in st.session_state:
-    now = pd.Timestamp.now().floor("min")
-    rows = []
-    for minute in range(180):  # 3 hours baseline
-        ts = now + pd.Timedelta(minutes=minute)
-        for r in ROOMS:
-            for g in GASES:
-                mu, sd = BASELINES[g]
-                val = np.random.normal(mu, sd)
-                rows.append({"timestamp": ts, "room": r["id"], "gas": g, "ppm": float(round(val, 2))})
-    st.session_state.df = pd.DataFrame(rows)
+    # Load sample_data.csv if present; else synthesize baseline
+    if os.path.exists("sample_data.csv"):
+        df = pd.read_csv("sample_data.csv", parse_dates=["timestamp"])
+    else:
+        now = pd.Timestamp.now().floor("min")
+        rows = []
+        for minute in range(180):
+            ts = now + pd.Timedelta(minutes=minute)
+            for r in ROOMS:
+                for g in GASES:
+                    mu, sd = BASELINES[g]
+                    val = np.random.normal(mu, sd)
+                    rows.append({"timestamp": ts, "room": r["id"], "gas": g, "ppm": float(round(val, 2))})
+        df = pd.DataFrame(rows)
+    st.session_state.df = df
     st.session_state.selected_room = None
     st.session_state.room_colors = {r["id"]: DEFAULT_COLOR for r in ROOMS}
     st.session_state.sim_history = []
-    st.session_state.alert_active = {}  # (room, gas) -> 'warning'/'critical'
-    st.session_state.incidents = []     # list of dicts with time, room, summary
-    st.session_state.counters = {}      # (date_str, room, gas, level) -> count
-    st.session_state.last_summary_text = None
-    st.session_state.last_summary_room = None
+    st.session_state.alert_active = {}     # (room, gas) -> "warning"/"critical"
+    st.session_state.incident_history = [] # list of summaries (newest first)
 
 df = st.session_state.df
 
@@ -74,8 +65,7 @@ def latest_room_avg(room_id: str) -> float:
 
 def room_any_status(room_id: str):
     d = df[df["room"] == room_id].sort_values("timestamp")
-    if d.empty:
-        return None
+    if d.empty: return None
     latest = d.groupby("gas").tail(1)
     status = None
     for _, row in latest.iterrows():
@@ -97,55 +87,53 @@ def default_camera():
 
 def spike_profile(gas: str, i: int, dur: int, peak: float):
     t = i / max(dur-1, 1)
-    if gas == "CH4":
-        return peak * (0.2 + 0.8 * t**1.5)
-    if gas == "H2S":
-        return peak * (0.3 + 0.7 * np.sin(np.pi * t))
-    if gas == "CO":
-        return peak * (0.6 if t < 0.2 else 1.0)
+    if gas == "CH4": return peak * (0.2 + 0.8 * t**1.5)
+    if gas == "H2S": return peak * (0.3 + 0.7 * np.sin(np.pi * t))
+    if gas == "CO":  return peak * (0.6 if t < 0.2 else 1.0)
     return peak * t
 
-def status_for(gas: str, value: float) -> str:
-    thr = THRESHOLDS[gas]
-    if value >= thr["critical"]:
-        return "Critical"
-    if value >= thr["warning"]:
-        return "Warning"
+def status_label(g, ppm):
+    thr = THRESHOLDS[g]
+    if ppm >= thr["critical"]: return "Critical"
+    if ppm >= thr["warning"]:  return "Warning"
     return "Safe"
 
-def count_and_get_n(date_str, room_id, gas, level):
-    key = (date_str, room_id, gas, level)
-    st.session_state.counters[key] = st.session_state.counters.get(key, 0) + 1
-    return st.session_state.counters[key]
-
-def build_incident_summary(room_id: str) -> str:
+def build_incident_summary(room_id: str, when: pd.Timestamp):
     room = next(r for r in ROOMS if r["id"] == room_id)
-    d = df[df["room"] == room_id]
-    if d.empty:
-        return f"Incident Report — {room['name']} {room['icon']}\nNo data."
-    latest_ts = d["timestamp"].max()
-    snap = d[d["timestamp"] == latest_ts]
-    date_str = pd.to_datetime(latest_ts).strftime("%Y-%m-%d")
-    lines = [f"Incident Report — {room['name']} {room['icon']}", f"Time: {pd.to_datetime(latest_ts).strftime('%Y-%m-%d %H:%M')}"]
+    room_df = df[(df["room"] == room_id) & (df["timestamp"] <= when)].sort_values("timestamp")
+    # pick last timestamp's readings
+    last_ts = room_df["timestamp"].max()
+    snapshot = room_df[room_df["timestamp"] == last_ts]
+    # compute repeat counts for the day (local day)
+    day_start = last_ts.floor("D")
+    counts = {}
     for g in GASES:
-        gd = snap[snap["gas"] == g]
-        if gd.empty:
-            continue
-        v = float(gd["ppm"].iloc[0])
-        s = status_for(g, v)
-        # increment counters if warning/critical
-        suffix = ""
-        if s == "Warning":
-            n = count_and_get_n(date_str, room_id, g, "warning")
-            suffix = f" — {n}{ordinal(n)} warning event today"
-        elif s == "Critical":
-            n = count_and_get_n(date_str, room_id, g, "critical")
-            suffix = f" — {n}{ordinal(n)} critical event today"
-        lines.append(f"{g}: {round(v,2)} ppm ({s}){suffix}")
+        gday = df[(df["room"] == room_id) & (df["gas"] == g) & (df["timestamp"] >= day_start) & (df["timestamp"] <= last_ts)]
+        w = (gday["ppm"] >= THRESHOLDS[g]["warning"]).sum()
+        c = (gday["ppm"] >= THRESHOLDS[g]["critical"]).sum()
+        counts[g] = (int(w), int(c))
+    lines = [f"Incident — {room['name']} {room['icon']}", f"Time: {last_ts.strftime('%Y-%m-%d %H:%M')}"]
+    for g in GASES:
+        row = snapshot[snapshot["gas"] == g]
+        ppm = float(row["ppm"].iloc[0]) if not row.empty else 0.0
+        label = status_label(g, ppm)
+        w_count, c_count = counts[g]
+        extra = ""
+        if label == "Critical":
+            extra = f" — {c_count} critical event(s) today"
+        elif label == "Warning":
+            extra = f" — {w_count} warning event(s) today"
+        lines.append(f"{g}: {ppm} ppm ({label}){extra}")
     return "\n".join(lines)
 
-def ordinal(n:int) -> str:
-    return "th" if 11<=n%100<=13 else {1:"st",2:"nd",3:"rd"}.get(n%10, "th")
+# --------- SIDEBAR INCIDENT HISTORY ---------
+with st.sidebar:
+    st.header("Incident History")
+    if len(st.session_state.incident_history) == 0:
+        st.caption("No incidents yet. Simulate one to see it here.")
+    else:
+        for s in st.session_state.incident_history:
+            st.code(s, language=None)
 
 # --------- TOP METRICS ---------
 st.subheader("Live Room Averages")
@@ -164,7 +152,7 @@ for i, r in enumerate(ROOMS):
 st.markdown("---")
 left, center, right = st.columns([1.2, 2.6, 1.6])
 
-# --------- CONTROLS + LEGEND + INCIDENT HISTORY ---------
+# --------- CONTROLS + LEGEND ---------
 with left:
     st.header("Controls")
     if st.button("Simulate Live Gas Event"):
@@ -190,6 +178,11 @@ with left:
                     new_rows.append({"timestamp": ts, "room": r["id"], "gas": g, "ppm": float(round(val, 2))})
         st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame(new_rows)], ignore_index=True)
 
+        # Update references
+        global df
+        df = st.session_state.df
+
+        # Color glow based on new status
         status = room_any_status(room["id"])
         if status == "critical":
             st.session_state.room_colors[room["id"]] = CRITICAL_COLOR
@@ -198,57 +191,27 @@ with left:
         else:
             st.session_state.room_colors[room["id"]] = WARNING_COLOR
 
+        # Auto-create incident summary and push to history (newest first)
         st.session_state.selected_room = room["id"]
+        summary = build_incident_summary(room["id"], st.session_state.df["timestamp"].max())
+        st.session_state.incident_history.insert(0, summary)
 
-        # Auto-build and store incident summary
-        summary = build_incident_summary(room["id"])
-        st.session_state.last_summary_text = summary
-        st.session_state.last_summary_room = room["id"]
-        st.session_state.incidents.append({"time": pd.Timestamp.now(), "room": room["id"], "summary": summary})
-        # Limit history to last 20 to keep tidy
-        st.session_state.incidents = st.session_state.incidents[-20:]
-
-        st.session_state.sim_history.append({
-            "time": pd.Timestamp.now(),
-            "room": room["id"],
-            "gases": gases_to_spike,
-            "severity": severity
-        })
-        st.experimental_rerun()
+        st.rerun()
 
     if st.button("Reset Data"):
         st.session_state.clear()
-        st.experimental_rerun()
+        st.rerun()
 
-    st.markdown("**Simulation history (latest 10)**")
-    for h in list(reversed(st.session_state.sim_history[-10:])):
-        gases_str = ", ".join(h["gases"]) if isinstance(h.get("gases", []), list) else "-"
-        st.write(f"- {h['time'].strftime('%H:%M:%S')} — {h['room']} — {gases_str} — {h['severity']}")
-
-    st.markdown("---")
-    st.header("Legend")
+    st.markdown("**Legend**")
     thr_df = pd.DataFrame({
         "Gas": ["CH4", "H2S", "CO"],
         "Warning": [THRESHOLDS["CH4"]["warning"], THRESHOLDS["H2S"]["warning"], THRESHOLDS["CO"]["warning"]],
         "Critical": [THRESHOLDS["CH4"]["critical"], THRESHOLDS["H2S"]["critical"], THRESHOLDS["CO"]["critical"]],
-        "Color": ["CH4", "H2S", "CO"]
     })
     st.dataframe(thr_df, hide_index=True, use_container_width=True)
     st.caption("Room color: amber = warning, red = critical.")
-    st.markdown("---")
-    st.caption("Tip: Click a room in the 3D map to zoom in. Click the same room again to zoom back out.")
 
-# Sidebar Incident History
-st.sidebar.header("Incident History")
-if st.session_state.incidents:
-    for inc in reversed(st.session_state.incidents):
-        room = next(r for r in ROOMS if r["id"] == inc["room"])
-        with st.sidebar.expander(f"{inc['time'].strftime('%H:%M:%S')} — {room['name']} {room['icon']}"):
-            st.code(inc["summary"])
-else:
-    st.sidebar.info("No incidents yet in this session.")
-
-# --------- 3D LOOP LAYOUT ---------
+# --------- 3D LAYOUT ---------
 mesh_traces = []
 marker_x, marker_y, marker_z, marker_text, marker_room_ids = [], [], [], [], []
 
@@ -287,12 +250,10 @@ fig.update_layout(
     scene_camera=cam
 )
 
-with st.container():
-    st.subheader("3D Floorplan (loop layout) — Click a room")
-    clicked = plotly_events(fig, click_event=True, hover_event=False, select_event=False, override_height=560)
-    st.plotly_chart(fig, use_container_width=True)
+# Click handling
+clicked = plotly_events(fig, click_event=True, hover_event=False, select_event=False, override_height=560)
+st.plotly_chart(fig, use_container_width=True)
 
-# Handle clicks
 if clicked and isinstance(clicked, list) and len(clicked) > 0:
     pt = clicked[0]
     curve = pt.get("curveNumber", None)
@@ -304,26 +265,24 @@ if clicked and isinstance(clicked, list) and len(clicked) > 0:
             st.session_state.selected_room = None
         else:
             st.session_state.selected_room = rid
-        st.experimental_rerun()
+        st.rerun()
 
-# --------- CSS for flashing badges ---------
-st.markdown("""
+# --------- STYLES ---------
+st.markdown('''
 <style>
-.badge { display:inline-block; padding:4px 8px; border-radius:12px; font-weight:600; margin-right:6px; }
+.badge {display:inline-block; padding:4px 8px; border-radius:12px; font-weight:600; margin-right:6px;}
 .badge-warning { background: rgba(255,184,77,0.25); color:#8a4b00; border:1px solid #ffb84d; }
 .badge-critical { background: rgba(255,76,76,0.25); color:#7a0000; border:1px solid #ff4c4c; }
-@keyframes flash { 0% {opacity: 1;} 50% {opacity: 0.35;} 100% {opacity: 1;} }
+@keyframes flash {0% {opacity:1;} 50% {opacity:0.35;} 100% {opacity:1;}}
 .flash { animation: flash 1.2s infinite; }
-.copy-btn { padding:6px 10px; border:1px solid #ddd; border-radius:8px; background:#fafafa; cursor:pointer; }
-.copy-btn:hover { background:#f0f0f0; }
 </style>
-""", unsafe_allow_html=True)
+''', unsafe_allow_html=True)
 
 def add_threshold_lines(fig, gases, opacity=0.7, annotate=True):
     shapes = []
     annotations = []
-    colors = {"warning": "rgba(255,184,77,{})".format(opacity),
-              "critical": "rgba(255,76,76,{})".format(opacity)}
+    colors = {"warning": f"rgba(255,184,77,{opacity})",
+              "critical": f"rgba(255,76,76,{opacity})"}
     for g in gases:
         w = THRESHOLDS[g]["warning"]
         c = THRESHOLDS[g]["critical"]
@@ -344,8 +303,7 @@ def update_alert_badges(room_id):
     room_df = df[df["room"] == room_id].sort_values("timestamp")
     for g in GASES:
         gdf = room_df[room_df["gas"] == g]
-        if gdf.empty:
-            continue
+        if gdf.empty: continue
         latest = float(gdf["ppm"].iloc[-1])
         thr = THRESHOLDS[g]
         key = (room_id, g)
@@ -356,41 +314,25 @@ def update_alert_badges(room_id):
         else:
             if key in st.session_state.alert_active:
                 del st.session_state.alert_active[key]
-
     # Render badges
     for (r, g), level in st.session_state.alert_active.items():
-        if r != room_id:
-            continue
+        if r != room_id: continue
         cls = "badge-critical flash" if level == "critical" else "badge-warning flash"
         label = "CRITICAL" if level == "critical" else "WARNING"
         st.markdown(f"<span class='badge {cls}'>{g} {label}</span>", unsafe_allow_html=True)
-
-def copy_to_clipboard(summary_text: str, key: str):
-    # Use a lightweight HTML button to access Clipboard API
-    safe = summary_text.replace("\n", "\\n").replace("'", "\'")
-    html_btn = f"""
-        <button class="copy-btn" onclick="navigator.clipboard.writeText('{safe}')">Copy incident summary</button>
-    """
-    components.html(html_btn, height=40)
 
 # --------- DETAIL VIEW ---------
 sel = st.session_state.selected_room
 if sel is None:
     st.header("Inspector")
-    st.write("Click a room to see its detectors (CH₄, H₂S, CO), live readings, forecasts, and incident summary.")
+    st.write("Click a room to see its detectors (CH₄, H₂S, CO), live readings, and forecasts.")
 else:
     room = next(r for r in ROOMS if r["id"] == sel)
     st.header(f"Room: {room['icon']} {room['name']}")
     room_df = df[df["room"] == sel].sort_values("timestamp")
 
-    # Alert badges (flash while out of range)
+    # Alert badges
     update_alert_badges(sel)
-
-    # Auto-show last summary if it belongs to this room
-    if st.session_state.last_summary_room == sel and st.session_state.last_summary_text:
-        st.subheader("Latest incident summary")
-        st.code(st.session_state.last_summary_text)
-        copy_to_clipboard(st.session_state.last_summary_text, key=f"copy_{sel}")
 
     # Metric cards per gas
     c1, c2, c3 = st.columns(3)
@@ -407,7 +349,7 @@ else:
             status = "WARNING"
         col.metric(f"{gas} — {status}", f"{latest} ppm", f"{delta} ppm")
 
-    # Line chart of all gases (measured) + threshold overlays
+    # Multi-gas recent readings with threshold overlays
     recent = room_df.groupby("gas").tail(150)
     fig_line = px.line(recent, x="timestamp", y="ppm", color="gas",
                        color_discrete_map=COLOR_MAP, markers=False,
@@ -416,7 +358,7 @@ else:
     fig_line.update_layout(height=300, margin=dict(l=0, r=0, t=30, b=0))
     st.plotly_chart(fig_line, use_container_width=True)
 
-    # Mini-forecast per gas (linear) + threshold overlays full opacity
+    # Per-gas short forecast
     st.subheader("Short-term forecast (next 5 mins)")
     fcols = st.columns(3)
     for col, gas in zip(fcols, GASES):
@@ -428,11 +370,8 @@ else:
             future_x = np.arange(len(gdf), len(gdf) + 5)
             future_y = m * future_x + b
             times = list(gdf["timestamp"]) + [gdf["timestamp"].iloc[-1] + pd.Timedelta(minutes=i) for i in range(1, 6)]
-            dfp = pd.DataFrame({
-                "time": times,
-                "ppm": list(y) + list(future_y),
-                "type": ["measured"] * len(y) + ["predicted"] * 5
-            })
+            dfp = pd.DataFrame({"time": times, "ppm": list(y) + list(future_y),
+                                "type": ["measured"] * len(y) + ["predicted"] * 5})
             fc = px.line(dfp, x="time", y="ppm", color="type", markers=True,
                          title=f"{gas} forecast (with thresholds)",
                          color_discrete_map={"measured": COLOR_MAP[gas], "predicted": "#7f7f7f"})
@@ -442,8 +381,20 @@ else:
         else:
             col.info(f"Not enough data to forecast {gas} yet.")
 
+    # ----- Incident Summary (auto & copy) -----
+    st.subheader("Latest Incident Summary")
+    # If we have at least one incident logged, show the last one for this room
+    room_summaries = [s for s in st.session_state.incident_history if f"— {room['name']}" in s or room['name'] in s]
+    if len(room_summaries) > 0:
+        summary = room_summaries[0]
+        st.code(summary, language=None)
+        if st.button("Copy incident summary"):
+            st.success("Summary ready to copy — select the text above and press Ctrl+C / Cmd+C.")
+    else:
+        st.caption("No incidents logged yet for this room. Use 'Simulate Live Gas Event'.")
+
 # --------- GLOW FADE ---------
 if any(c in [WARNING_COLOR, CRITICAL_COLOR] for c in st.session_state.room_colors.values()):
     time.sleep(1.5)
     st.session_state.room_colors = {r["id"]: DEFAULT_COLOR for r in ROOMS}
-    st.experimental_rerun()
+    st.rerun()
