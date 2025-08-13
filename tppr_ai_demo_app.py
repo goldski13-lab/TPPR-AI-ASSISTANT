@@ -179,7 +179,7 @@ with left:
         st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame(new_rows)], ignore_index=True)
 
         # Update references
-        global df
+
         df = st.session_state.df
 
         # Color glow based on new status
